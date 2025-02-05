@@ -13,9 +13,10 @@ import type {
 import {decode, encode} from "@automerge/automerge-repo/helpers/cbor.js"
 import {type Peer} from "crossws"
 
-class ManagedNetwork extends NetworkAdapter {
+class VinxiNetworkAdapter extends NetworkAdapter {
 	peersByAutomerge: Map<PeerId, Peer> = new Map()
 	peersByVinxi: Map<string, Peer> = new Map()
+	peerIdByVinxi: Map<string, PeerId> = new Map()
 
 	#ready = false
 	#readyResolver?: () => void
@@ -46,9 +47,50 @@ class ManagedNetwork extends NetworkAdapter {
 	}
 
 	disconnect() {
-		// todo destroy
-		// this.peers.delete(peerId)
+		for (const peerId of this.peersByAutomerge.keys()) {
+			this.removePeer(peerId)
+		}
 	}
+
+	receiveMessage(peer: Peer, bytes: Uint8Array) {
+		let message: FromClientMessage
+		try {
+			message = decode(bytes)
+		} catch (e) {
+			console.error("decode error", e)
+			return
+		}
+
+		if (isJoinMessage(message)) {
+			// Let the repo know that we have a new connection.
+			network.emit("peer-candidate", {
+				peerId: message.senderId,
+				peerMetadata: message.peerMetadata,
+			})
+
+			if (message.supportedProtocolVersions.includes("1")) {
+				this.meetPeer(message.senderId, peer)
+				this.send({
+					type: "peer",
+					senderId: network.peerId!,
+					peerMetadata: network.peerMetadata!,
+					selectedProtocolVersion: "1",
+					targetId: message.senderId,
+				})
+			} else {
+				this.send({
+					type: "error",
+					senderId: network.peerId!,
+					message: "unsupported protocol version",
+					targetId: message.senderId,
+				})
+				this.removePeer(message.senderId)
+			}
+		} else {
+			network.emit("message", message)
+		}
+	}
+
 	send(message: FromServerMessage) {
 		const targetId = message.targetId
 		const peer = this.peersByAutomerge.get(targetId)
@@ -57,22 +99,35 @@ class ManagedNetwork extends NetworkAdapter {
 		const arraybuffer = buffer.slice(byteOffset, byteOffset + byteLength)
 
 		if (peer) {
-			// todo {binary: true}?
+			// @ts-expect-error i am pretty sure {binary: true} is real
 			peer.send(arraybuffer, {binary: true})
 		} else {
 			console.error("peer not found", targetId)
 		}
 	}
 
-	addPeer(peer: Peer) {
+	registerPeer(peer: Peer) {
 		this.peersByVinxi.set(peer.id, peer)
 	}
 
-	knowPeer(peerId: PeerId, peer: Peer) {
+	meetPeer(peerId: PeerId, peer: Peer) {
 		this.peersByAutomerge.set(peerId, peer)
+		this.peerIdByVinxi.set(peer.id, peerId)
+	}
+
+	removePeer(peerId: PeerId) {
+		const peer = this.peersByAutomerge.get(peerId)
+		this.peersByAutomerge.delete(peerId)
+		peer && this.peersByVinxi.delete(peer.id)
+		peer && this.peerIdByVinxi.delete(peer.id)
+	}
+
+	removePeerByVinxi(id: string) {
+		const peerId = this.peerIdByVinxi.get(id)
+		peerId && this.removePeer(peerId)
 	}
 }
-const network = new ManagedNetwork()
+const network = new VinxiNetworkAdapter()
 
 import os from "node:os"
 import {isJoinMessage} from "@automerge/automerge-repo-network-websocket/dist/messages.js"
@@ -90,75 +145,18 @@ export default eventHandler({
 	websocket: {
 		async open(peer) {
 			peer.ctx.node.ws.binaryType = "arraybuffer"
-			network.addPeer(peer)
+			network.registerPeer(peer)
 		},
 		async message(peer, msg) {
 			const incoming = msg.rawData
 			const bytes = new Uint8Array(incoming)
-			let message: FromClientMessage
-			try {
-				message = decode(bytes)
-			} catch (e) {
-				// socket.close()
-				console.error("decode error", e)
-				return
-			}
-			const {type, senderId} = message
-			const myPeerId = network.peerId
-
-			const documentId = "documentId" in message ? "@" + message.documentId : ""
-			const {byteLength} = bytes
-			console.info(
-				`[${senderId}->${myPeerId}${documentId}] ${type} | ${byteLength} bytes`
-			)
-
-			if (isJoinMessage(message)) {
-				const {peerMetadata, supportedProtocolVersions} = message
-				const existingSocket = network.peersByAutomerge.get(message.senderId)
-				if (existingSocket) {
-					// if (existingSocket.readyState === WebSocket.OPEN) {
-					// existingSocket.close()
-					// }
-					// todo remove peer
-					network.emit("peer-disconnected", {peerId: senderId})
-				}
-				// Let the repo know that we have a new connection.
-				network.emit("peer-candidate", {peerId: senderId, peerMetadata})
-
-				network.knowPeer(senderId, peer)
-				// const selectedProtocolVersion = selectProtocol(
-				// 	supportedProtocolVersions
-				// )
-				if (message.supportedProtocolVersions.includes("1")) {
-					// todo add a wrapper for this that includes the sender,
-					// metadata and protocol
-					network.send({
-						type: "peer",
-						senderId: network.peerId!,
-						peerMetadata: network.peerMetadata!,
-						selectedProtocolVersion: "1",
-						targetId: senderId,
-					})
-				} else {
-					/* network.send({
-						type: "error",
-						senderId: network.peerId!,
-						message: "unsupported protocol version",
-						targetId: senderId,
-					}) */
-					// todo removePeer
-					// this.sockets[senderId].close()
-					// delete this.sockets[senderId]
-				}
-			} else {
-				network.emit("message", message)
-			}
+			network.receiveMessage(peer, bytes)
 		},
-		async close(peer, details) {
-			// todo network.removePeer(peer.id)
+		async close(peer) {
+			network.removePeerByVinxi(peer.id)
 		},
 		async error(peer, error) {
-			// todo error
+			network.removePeerByVinxi(peer.id)
 		},
 	},
 })
