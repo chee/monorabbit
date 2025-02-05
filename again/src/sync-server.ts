@@ -160,4 +160,3 @@ export default eventHandler({
 		},
 	},
 })
-function selectProtocol(supportedProtocolVersions: "1"[]) {}
